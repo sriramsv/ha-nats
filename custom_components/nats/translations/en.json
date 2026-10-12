@@ -80,7 +80,7 @@
   "services": {
     "publish": {
       "name": "Publish",
-      "description": "Publishes a message to a NATS subject.",
+      "description": "Publishes a message to a NATS subject. Returns the subject, and with JetStream also the stream and sequence number.",
       "fields": {
         "subject": {
           "name": "Subject",
@@ -110,6 +110,9 @@
     },
     "publish_failed": {
       "message": "Publishing to {subject} failed: {error}"
+    },
+    "permission_denied": {
+      "message": "The NATS server doesn't allow this user to publish to {subject}. Check the user's publish permissions."
     }
   }
 }

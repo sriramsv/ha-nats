@@ -55,12 +55,17 @@ class NatsServer:
     """A nats-server subprocess that can be stopped and restarted."""
 
     def __init__(
-        self, store_dir: Path, user: str | None = None, password: str | None = None
+        self,
+        store_dir: Path,
+        user: str | None = None,
+        password: str | None = None,
+        config: str | None = None,
     ) -> None:
         self.port = _free_port()
         self.store_dir = store_dir
         self.user = user
         self.password = password
+        self.config = config
         self._proc: subprocess.Popen | None = None
 
     @property
@@ -72,6 +77,10 @@ class NatsServer:
         if password is not None:
             self.password = password
         auth = ["--user", self.user, "--pass", self.password] if self.user else []
+        if self.config is not None:
+            conf = self.store_dir.parent / "nats.conf"
+            conf.write_text(self.config)
+            auth = ["-c", str(conf)]
         self._proc = subprocess.Popen(
             [NATS_SERVER, "-a", "127.0.0.1", "-p", str(self.port),
              "-js", "-sd", str(self.store_dir), *auth],
@@ -104,6 +113,27 @@ def nats_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
 @pytest.fixture
 def nats_auth_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
     yield from _server(tmp_path, user="ha", password="secret")
+
+
+RESTRICTED_CONFIG = """
+authorization {
+  users = [
+    {
+      user: ha, password: secret,
+      permissions: {
+        publish: { allow: ["allowed.>"] },
+        subscribe: { allow: ["allowed.>", "_INBOX.>"] }
+      }
+    }
+  ]
+}
+"""
+
+
+@pytest.fixture
+def nats_restricted_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
+    """User `ha` may only publish to `allowed.>`."""
+    yield from _server(tmp_path, config=RESTRICTED_CONFIG)
 
 
 async def setup_entry(
