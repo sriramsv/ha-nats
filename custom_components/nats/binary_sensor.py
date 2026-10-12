@@ -7,35 +7,41 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from . import NatsConfigEntry
 from .bridge import NatsBridge
 from .const import DOMAIN, SIGNAL_CONNECTION_STATE
 
 
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    entry: NatsConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    if discovery_info is None:
-        return
-    async_add_entities([NatsConnectedSensor(hass.data[DOMAIN])])
+    async_add_entities([NatsConnectedSensor(entry.runtime_data, entry.entry_id)])
 
 
 class NatsConnectedSensor(BinarySensorEntity):
     """On while the NATS connection is up."""
 
-    _attr_name = "NATS connected"
+    _attr_has_entity_name = True
+    _attr_translation_key = "connected"
+    # Same unique_id as the YAML-era entity, so its entity_id and history carry over.
     _attr_unique_id = "nats_connected"
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
     _attr_should_poll = False
 
-    def __init__(self, bridge: NatsBridge) -> None:
+    def __init__(self, bridge: NatsBridge, entry_id: str) -> None:
         self._bridge = bridge
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry_id)},
+            name="NATS",
+            manufacturer="NATS",
+            entry_type=DeviceEntryType.SERVICE,
+        )
 
     @property
     def is_on(self) -> bool:

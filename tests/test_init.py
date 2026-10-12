@@ -6,19 +6,18 @@ import json
 import nats
 import pytest
 import voluptuous as vol
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import async_capture_events
 
-DOMAIN = "nats"
+from .conftest import DOMAIN, setup_entry
+
 SENSOR = "binary_sensor.nats_connected"
-
-
-async def _setup(hass: HomeAssistant, url: str, **extra) -> None:
-    config = {DOMAIN: {"url": url, **extra}}
-    assert await async_setup_component(hass, DOMAIN, config)
-    await hass.async_block_till_done()
 
 
 async def _wait_until(predicate, timeout: float = 5.0) -> None:
@@ -31,16 +30,33 @@ async def _wait_connected(hass: HomeAssistant) -> None:
     await _wait_until(lambda: (s := hass.states.get(SENSOR)) and s.state == "on")
 
 
+def _reauth_flows(hass: HomeAssistant) -> list:
+    return [
+        flow for flow in hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        if flow["context"]["source"] == "reauth"
+    ]
+
+
 async def test_connects_and_reports_connectivity(hass, nats_server):
-    await _setup(hass, nats_server.url)
+    entry = await setup_entry(hass, nats_server.url)
+    assert entry.state is ConfigEntryState.LOADED
     await _wait_connected(hass)
     assert hass.states.get(SENSOR).attributes["device_class"] == "connectivity"
+
+
+async def test_sensor_belongs_to_a_service_device(hass, nats_server):
+    entry = await setup_entry(hass, nats_server.url)
+    entity = er.async_get(hass).async_get(SENSOR)
+    assert entity.config_entry_id == entry.entry_id
+    device = dr.async_get(hass).async_get(entity.device_id)
+    assert device.name == "NATS"
+    assert device.entry_type is dr.DeviceEntryType.SERVICE
 
 
 async def test_publish_dict_payload_as_json(hass, nats_server):
     client = await nats.connect(nats_server.url)
     sub = await client.subscribe("claude.tasks.test")
-    await _setup(hass, nats_server.url)
+    await setup_entry(hass, nats_server.url)
     await _wait_connected(hass)
 
     await hass.services.async_call(
@@ -59,7 +75,7 @@ async def test_publish_dict_payload_as_json(hass, nats_server):
 async def test_publish_string_payload_raw(hass, nats_server):
     client = await nats.connect(nats_server.url)
     sub = await client.subscribe("events.raw")
-    await _setup(hass, nats_server.url)
+    await setup_entry(hass, nats_server.url)
     await _wait_connected(hass)
 
     await hass.services.async_call(
@@ -74,7 +90,7 @@ async def test_publish_string_payload_raw(hass, nats_server):
 
 @pytest.mark.parametrize("subject", ["has space", "claude.*", "claude.>", "a..b", ".a"])
 async def test_publish_rejects_invalid_subject(hass, nats_server, subject):
-    await _setup(hass, nats_server.url)
+    await setup_entry(hass, nats_server.url)
     await _wait_connected(hass)
     with pytest.raises((ServiceValidationError, vol.Invalid)):
         await hass.services.async_call(
@@ -85,7 +101,7 @@ async def test_publish_rejects_invalid_subject(hass, nats_server, subject):
 async def test_publish_jetstream_returns_ack(hass, nats_server):
     client = await nats.connect(nats_server.url)
     await client.jetstream().add_stream(name="T", subjects=["claude.tasks.>"])
-    await _setup(hass, nats_server.url)
+    await setup_entry(hass, nats_server.url)
     await _wait_connected(hass)
 
     result = await hass.services.async_call(
@@ -100,7 +116,7 @@ async def test_publish_jetstream_returns_ack(hass, nats_server):
 
 async def test_subscription_fires_event_with_parsed_json(hass, nats_server):
     events = async_capture_events(hass, "nats_message")
-    await _setup(hass, nats_server.url, subscribe=["claude.progress.>"])
+    await setup_entry(hass, nats_server.url, subscribe=["claude.progress.>"])
     await _wait_connected(hass)
 
     client = await nats.connect(nats_server.url)
@@ -123,8 +139,9 @@ async def test_durable_consumer_fires_event_and_acks(hass, nats_server):
     await js.publish("claude.replies.t1", b'{"id": "t1", "status": "pr_opened"}')
 
     events = async_capture_events(hass, "nats_message")
-    await _setup(hass, nats_server.url,
-                 consume=[{"stream": "CLAUDE_REPLIES", "durable": "ha"}])
+    await setup_entry(
+        hass, nats_server.url, consume=[{"stream": "CLAUDE_REPLIES", "durable": "ha"}]
+    )
     await _wait_until(lambda: len(events) == 1)
 
     assert events[0].data["subject"] == "claude.replies.t1"
@@ -142,7 +159,7 @@ async def test_durable_consumer_fires_event_and_acks(hass, nats_server):
 
 
 async def test_publish_while_disconnected_raises(hass, nats_server):
-    await _setup(hass, nats_server.url)
+    await setup_entry(hass, nats_server.url)
     await _wait_connected(hass)
     nats_server.stop()
     await _wait_until(lambda: hass.states.get(SENSOR).state == "off")
@@ -155,7 +172,7 @@ async def test_publish_while_disconnected_raises(hass, nats_server):
 
 async def test_reconnects_after_server_restart(hass, nats_server):
     events = async_capture_events(hass, "nats_message")
-    await _setup(hass, nats_server.url, subscribe=["events.>"])
+    await setup_entry(hass, nats_server.url, subscribe=["events.>"])
     await _wait_connected(hass)
     nats_server.stop()
     await _wait_until(lambda: hass.states.get(SENSOR).state == "off")
@@ -169,11 +186,88 @@ async def test_reconnects_after_server_restart(hass, nats_server):
     await client.close()
 
 
-async def test_setup_succeeds_when_server_down_then_connects(hass, nats_server):
+async def test_setup_retries_while_server_down(hass, nats_server):
     nats_server.stop()
-    await _setup(hass, nats_server.url)
-    assert hass.states.get(SENSOR).state == "off"
+    entry = await setup_entry(hass, nats_server.url)
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+
     nats_server.start()
-    await _wait_until(
-        lambda: hass.states.get(SENSOR).state == "on", timeout=15,
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    await _wait_connected(hass)
+
+
+async def test_setup_with_wrong_password_starts_reauth(hass, nats_auth_server):
+    entry = await setup_entry(
+        hass, nats_auth_server.url, username="ha", password="wrong"
     )
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert len(_reauth_flows(hass)) == 1
+
+
+async def test_password_rotated_while_running_starts_reauth(hass, nats_auth_server):
+    await setup_entry(hass, nats_auth_server.url, username="ha", password="secret")
+    await _wait_connected(hass)
+
+    nats_auth_server.stop()
+    nats_auth_server.start(password="rotated")
+
+    await _wait_until(lambda: len(_reauth_flows(hass)) == 1, timeout=15)
+
+
+async def test_unload_disconnects_and_service_reports_not_loaded(hass, nats_server):
+    entry = await setup_entry(hass, nats_server.url)
+    await _wait_connected(hass)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN, "publish", {"subject": "a.b", "payload": "x"}, blocking=True,
+        )
+
+
+async def test_yaml_is_imported_into_a_config_entry(hass, nats_auth_server):
+    config = {
+        DOMAIN: {
+            "url": nats_auth_server.url,
+            "user": "ha",
+            "password": "secret",
+            "subscribe": ["claude.progress.>"],
+            "consume": [{"stream": "CLAUDE_REPLIES", "durable": "ha"}],
+        }
+    }
+    assert await async_setup_component(hass, DOMAIN, config)
+    await hass.async_block_till_done()
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.data == {
+        "url": nats_auth_server.url,
+        "username": "ha",
+        "password": "secret",
+        "client_name": "home-assistant",
+    }
+    assert entry.options == {
+        "subscribe": ["claude.progress.>"],
+        "consume": [{"stream": "CLAUDE_REPLIES", "durable": "ha"}],
+    }
+    assert entry.state is ConfigEntryState.LOADED
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "deprecated_yaml") is not None
+    await _wait_connected(hass)
+
+
+async def test_yaml_import_keeps_existing_entry(hass, nats_server):
+    entry = await setup_entry(hass, nats_server.url)
+    assert await async_setup_component(
+        hass, DOMAIN, {DOMAIN: {"url": "nats://elsewhere:4222"}}
+    )
+    await hass.async_block_till_done()
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    assert entries == [entry]
+    assert entry.data["url"] == nats_server.url

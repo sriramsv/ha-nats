@@ -1,16 +1,9 @@
 """NATS integration: publish to NATS from HA, and turn NATS messages into events.
 
-Configured in YAML:
-
-    nats:
-      url: nats://192.168.1.10:4222
-      user: ha
-      password: !secret nats_password
-      subscribe:            # core subscriptions (lost while disconnected)
-        - sensors.>
-      consume:              # JetStream durable pull consumers (at-least-once)
-        - stream: REPLIES
-          durable: ha
+Set up from the UI (Settings → Devices & services → Add integration → NATS).
+The connection lives in the config entry; subjects to subscribe to and
+JetStream durable consumers to read are the entry's options. A legacy
+`nats:` YAML block is imported into an entry once.
 
 Every inbound message fires a `nats_message` event with subject, data (parsed
 JSON when possible), headers, and for consumers also stream and seq.
@@ -21,9 +14,11 @@ from __future__ import annotations
 import voluptuous as vol
 from nats.errors import Error as NatsError
 
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_URL,
+    CONF_USERNAME,
     EVENT_HOMEASSISTANT_STOP,
     Platform,
 )
@@ -34,12 +29,25 @@ from homeassistant.core import (
     ServiceResponse,
     SupportsResponse,
 )
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.discovery import async_load_platform
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.typing import ConfigType
 
-from .bridge import BridgeConfig, ConsumerSpec, NatsBridge, NotConnected
+from .bridge import (
+    BridgeConfig,
+    CannotConnect,
+    ConsumerSpec,
+    InvalidAuth,
+    NatsBridge,
+    NotConnected,
+    probe_connection,
+)
 from .const import (
     ATTR_HEADERS,
     ATTR_JETSTREAM,
@@ -51,54 +59,28 @@ from .const import (
     CONF_FILTER_SUBJECT,
     CONF_STREAM,
     CONF_SUBSCRIBE,
+    CONF_YAML_USER,
     DEFAULT_CLIENT_NAME,
     DOMAIN,
+    ISSUE_DEPRECATED_YAML,
     SERVICE_PUBLISH,
 )
+from .schema import CONSUME_LIST, SUBSCRIBE_LIST, publish_subject
 
+PLATFORMS = [Platform.BINARY_SENSOR]
 
-def _subject(value: str, *, wildcards: bool) -> str:
-    value = cv.string(value)
-    tokens = value.split(".")
-    if any(not token or any(c.isspace() for c in token) for token in tokens):
-        raise vol.Invalid(f"invalid NATS subject: {value!r}")
-    if not wildcards and any(token in ("*", ">") for token in tokens):
-        raise vol.Invalid(f"wildcards aren't allowed when publishing: {value!r}")
-    if wildcards and ">" in tokens[:-1]:
-        raise vol.Invalid(f"'>' must be the last token: {value!r}")
-    return value
-
-
-def publish_subject(value: str) -> str:
-    return _subject(value, wildcards=False)
-
-
-def subscribe_subject(value: str) -> str:
-    return _subject(value, wildcards=True)
-
-
-CONSUMER_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_STREAM): cv.string,
-        vol.Required(CONF_DURABLE): cv.string,
-        vol.Optional(CONF_FILTER_SUBJECT): subscribe_subject,
-    }
-)
+type NatsConfigEntry = ConfigEntry[NatsBridge]
 
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
             {
                 vol.Required(CONF_URL): cv.string,
-                vol.Optional("user"): cv.string,
+                vol.Optional(CONF_YAML_USER): cv.string,
                 vol.Optional(CONF_PASSWORD): cv.string,
                 vol.Optional(CONF_CLIENT_NAME, default=DEFAULT_CLIENT_NAME): cv.string,
-                vol.Optional(CONF_SUBSCRIBE, default=[]): vol.All(
-                    cv.ensure_list, [subscribe_subject]
-                ),
-                vol.Optional(CONF_CONSUME, default=[]): vol.All(
-                    cv.ensure_list, [CONSUMER_SCHEMA]
-                ),
+                vol.Optional(CONF_SUBSCRIBE, default=[]): SUBSCRIBE_LIST,
+                vol.Optional(CONF_CONSUME, default=[]): CONSUME_LIST,
             }
         )
     },
@@ -115,29 +97,96 @@ PUBLISH_SCHEMA = vol.Schema(
 )
 
 
-def _bridge_config(conf: ConfigType) -> BridgeConfig:
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the publish action, and import any YAML config."""
+    _register_publish(hass)
+    if DOMAIN in config:
+        hass.async_create_task(_import_yaml(hass, config[DOMAIN]))
+    return True
+
+
+async def _import_yaml(hass: HomeAssistant, conf: ConfigType) -> None:
+    import_data = {
+        CONF_URL: conf[CONF_URL],
+        CONF_CLIENT_NAME: conf[CONF_CLIENT_NAME],
+        CONF_SUBSCRIBE: conf[CONF_SUBSCRIBE],
+        CONF_CONSUME: conf[CONF_CONSUME],
+    }
+    if CONF_YAML_USER in conf:
+        import_data[CONF_USERNAME] = conf[CONF_YAML_USER]
+        import_data[CONF_PASSWORD] = conf.get(CONF_PASSWORD, "")
+    await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_IMPORT}, data=import_data
+    )
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        ISSUE_DEPRECATED_YAML,
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_DEPRECATED_YAML,
+        translation_placeholders={"domain": DOMAIN},
+    )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: NatsConfigEntry) -> bool:
+    config = _bridge_config(entry)
+    try:
+        await probe_connection(config.url, config.user, config.password, config.client_name)
+    except InvalidAuth as err:
+        raise ConfigEntryAuthFailed(f"{config.url} rejected the credentials") from err
+    except CannotConnect as err:
+        raise ConfigEntryNotReady(f"Can't reach {config.url}: {err}") from err
+
+    bridge = NatsBridge(hass, config, on_auth_failed=lambda: entry.async_start_reauth(hass))
+    entry.runtime_data = bridge
+    bridge.start()
+
+    async def on_stop(_event: Event) -> None:
+        await bridge.stop()
+
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop))
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: NatsConfigEntry) -> bool:
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        await entry.runtime_data.stop()
+    return unloaded
+
+
+def _bridge_config(entry: ConfigEntry) -> BridgeConfig:
+    data, options = entry.data, entry.options
     return BridgeConfig(
-        url=conf[CONF_URL],
-        user=conf.get("user"),
-        password=conf.get(CONF_PASSWORD),
-        client_name=conf[CONF_CLIENT_NAME],
-        subscribe=tuple(conf[CONF_SUBSCRIBE]),
+        url=data[CONF_URL],
+        user=data.get(CONF_USERNAME),
+        password=data.get(CONF_PASSWORD),
+        client_name=data.get(CONF_CLIENT_NAME, DEFAULT_CLIENT_NAME),
+        subscribe=tuple(options.get(CONF_SUBSCRIBE, ())),
         consume=tuple(
             ConsumerSpec(
                 stream=c[CONF_STREAM],
                 durable=c[CONF_DURABLE],
                 filter_subject=c.get(CONF_FILTER_SUBJECT),
             )
-            for c in conf[CONF_CONSUME]
+            for c in options.get(CONF_CONSUME, ())
         ),
     )
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    bridge = NatsBridge(hass, _bridge_config(config[DOMAIN]))
-    hass.data[DOMAIN] = bridge
+def _loaded_bridge(hass: HomeAssistant) -> NatsBridge:
+    entries: list[NatsConfigEntry] = hass.config_entries.async_loaded_entries(DOMAIN)
+    if not entries:
+        raise ServiceValidationError(translation_domain=DOMAIN, translation_key="not_loaded")
+    return entries[0].runtime_data
 
+
+def _register_publish(hass: HomeAssistant) -> None:
     async def handle_publish(call: ServiceCall) -> ServiceResponse:
+        bridge = _loaded_bridge(hass)
         try:
             ack = await bridge.publish(
                 call.data[ATTR_SUBJECT],
@@ -163,14 +212,3 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         DOMAIN, SERVICE_PUBLISH, handle_publish,
         schema=PUBLISH_SCHEMA, supports_response=SupportsResponse.OPTIONAL,
     )
-
-    async def on_stop(_event: Event) -> None:
-        await bridge.stop()
-
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
-
-    bridge.start()
-    hass.async_create_task(
-        async_load_platform(hass, Platform.BINARY_SENSOR, DOMAIN, {}, config)
-    )
-    return True

@@ -11,8 +11,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 NATS_SERVER = shutil.which("nats-server")
+DOMAIN = "nats"
 
 
 def _free_port() -> int:
@@ -51,19 +54,27 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 class NatsServer:
     """A nats-server subprocess that can be stopped and restarted."""
 
-    def __init__(self, store_dir: Path) -> None:
+    def __init__(
+        self, store_dir: Path, user: str | None = None, password: str | None = None
+    ) -> None:
         self.port = _free_port()
         self.store_dir = store_dir
+        self.user = user
+        self.password = password
         self._proc: subprocess.Popen | None = None
 
     @property
     def url(self) -> str:
         return f"nats://127.0.0.1:{self.port}"
 
-    def start(self) -> None:
+    def start(self, password: str | None = None) -> None:
+        """Start the server; `password` replaces the configured one."""
+        if password is not None:
+            self.password = password
+        auth = ["--user", self.user, "--pass", self.password] if self.user else []
         self._proc = subprocess.Popen(
             [NATS_SERVER, "-a", "127.0.0.1", "-p", str(self.port),
-             "-js", "-sd", str(self.store_dir)],
+             "-js", "-sd", str(self.store_dir), *auth],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -76,11 +87,44 @@ class NatsServer:
             self._proc = None
 
 
-@pytest.fixture
-def nats_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
+def _server(tmp_path: Path, **auth) -> Iterator[NatsServer]:
     if NATS_SERVER is None:
         pytest.skip("nats-server binary not installed")
-    server = NatsServer(tmp_path / "js")
+    server = NatsServer(tmp_path / "js", **auth)
     server.start()
     yield server
     server.stop()
+
+
+@pytest.fixture
+def nats_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
+    yield from _server(tmp_path)
+
+
+@pytest.fixture
+def nats_auth_server(tmp_path: Path, socket_enabled) -> Iterator[NatsServer]:
+    yield from _server(tmp_path, user="ha", password="secret")
+
+
+async def setup_entry(
+    hass: HomeAssistant,
+    url: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    **options,
+) -> MockConfigEntry:
+    """Add and set up a config entry for `url` with the given options."""
+    data = {"url": url, "client_name": "home-assistant"}
+    if username is not None:
+        data |= {"username": username, "password": password}
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=url,
+        data=data,
+        options={"subscribe": [], "consume": [], **options},
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry

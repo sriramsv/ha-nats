@@ -1,4 +1,82 @@
 {
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to NATS",
+        "description": "Enter the address of your NATS server. Leave username and password empty if the server allows anonymous access.",
+        "data": {
+          "url": "Server URL",
+          "username": "Username",
+          "password": "Password",
+          "client_name": "Client name"
+        },
+        "data_description": {
+          "url": "For example nats://192.168.1.10:4222 (or tls:// for TLS).",
+          "client_name": "Shown in the server's connection list."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with NATS",
+        "description": "The server at {url} rejected the saved credentials. Enter the current ones.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Change NATS connection",
+        "data": {
+          "url": "Server URL",
+          "username": "Username",
+          "password": "Password",
+          "client_name": "Client name"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Can't reach the NATS server at that address.",
+      "invalid_auth": "The server rejected the username or password.",
+      "invalid_url": "Use a URL like nats://host:4222 or tls://host:4222."
+    },
+    "abort": {
+      "single_instance_allowed": "NATS is already configured. Only one server is supported.",
+      "reauth_successful": "Re-authenticated successfully.",
+      "reconfigure_successful": "Connection updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Subscriptions and consumers",
+        "description": "Every message received fires a `nats_message` event.",
+        "data": {
+          "subscribe": "Subjects to subscribe to",
+          "consume": "JetStream durable consumers"
+        },
+        "data_description": {
+          "subscribe": "Core subscriptions, at-most-once. Wildcards allowed: `*`, and `>` as the last token.",
+          "consume": "At-least-once. A list like `- stream: REPLIES` / `durable: ha` / optional `filter_subject: replies.>`. Missing consumers are created."
+        }
+      }
+    },
+    "error": {
+      "invalid_subject": "One of the subjects isn't valid: no spaces or empty tokens, and `>` only at the end.",
+      "invalid_consumer": "Each consumer needs `stream` and `durable`, and an optional valid `filter_subject`."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "connected": {
+        "name": "Connected"
+      }
+    }
+  },
+  "issues": {
+    "deprecated_yaml": {
+      "title": "NATS YAML configuration was imported",
+      "description": "Your `{domain}:` YAML configuration has been imported into the UI. Remove it from your YAML files and restart Home Assistant; manage the connection and subscriptions under Settings → Devices & services → NATS from now on."
+    }
+  },
   "services": {
     "publish": {
       "name": "Publish",
@@ -24,6 +102,9 @@
     }
   },
   "exceptions": {
+    "not_loaded": {
+      "message": "The NATS integration isn't set up or is disabled."
+    },
     "not_connected": {
       "message": "Not connected to the NATS server."
     },
