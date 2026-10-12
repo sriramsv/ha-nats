@@ -98,6 +98,57 @@ async def test_publish_rejects_invalid_subject(hass, nats_server, subject):
         )
 
 
+async def test_publish_core_returns_response_when_asked(hass, nats_server):
+    """Developer Tools always asks for a response; a core publish must give one."""
+    await setup_entry(hass, nats_server.url)
+    await _wait_connected(hass)
+
+    result = await hass.services.async_call(
+        DOMAIN, "publish", {"subject": "events.raw", "payload": "x"},
+        blocking=True, return_response=True,
+    )
+
+    assert result == {"subject": "events.raw", "jetstream": False}
+
+
+async def test_publish_to_denied_subject_raises(hass, nats_restricted_server):
+    client = await nats.connect(
+        nats_restricted_server.url, user="ha", password="secret"
+    )
+    sub = await client.subscribe("allowed.ok")
+    await setup_entry(
+        hass, nats_restricted_server.url, username="ha", password="secret"
+    )
+    await _wait_connected(hass)
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN, "publish", {"subject": "test", "payload": "x"}, blocking=True,
+        )
+    assert err.value.translation_key == "permission_denied"
+
+    # The connection survives, and allowed subjects still work afterwards.
+    await hass.services.async_call(
+        DOMAIN, "publish", {"subject": "allowed.ok", "payload": "y"}, blocking=True,
+    )
+    assert (await sub.next_msg(timeout=2)).data == b"y"
+    await client.close()
+
+
+async def test_publish_jetstream_to_denied_subject_raises(hass, nats_restricted_server):
+    await setup_entry(
+        hass, nats_restricted_server.url, username="ha", password="secret"
+    )
+    await _wait_connected(hass)
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            DOMAIN, "publish", {"subject": "test", "payload": "x", "jetstream": True},
+            blocking=True, return_response=True,
+        )
+    assert err.value.translation_key == "permission_denied"
+
+
 async def test_publish_jetstream_returns_ack(hass, nats_server):
     client = await nats.connect(nats_server.url)
     await client.jetstream().add_stream(name="T", subjects=["claude.tasks.>"])
@@ -110,7 +161,8 @@ async def test_publish_jetstream_returns_ack(hass, nats_server):
         blocking=True, return_response=True,
     )
 
-    assert result == {"stream": "T", "seq": 1}
+    assert result == {"subject": "claude.tasks.ask", "jetstream": True,
+                      "stream": "T", "seq": 1}
     await client.close()
 
 

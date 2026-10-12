@@ -72,7 +72,8 @@ history are kept.
 | `headers` | no | NATS headers, string keys and values. |
 | `jetstream` | no | Publish through JetStream and wait for the stream's ack. Needs a stream that captures the subject. |
 
-With `jetstream: true` the service returns `{stream, seq}`:
+The action returns what it did: `{subject, jetstream: false}` for a core
+publish, and `{subject, jetstream: true, stream, seq}` with JetStream:
 
 ```yaml
 action: nats.publish
@@ -84,10 +85,12 @@ data:
   headers:
     source: home-assistant
   jetstream: true
-response_variable: ack   # → {"stream": "TASKS", "seq": 42}
+response_variable: ack   # → {"subject": "tasks.ask", "jetstream": true, "stream": "TASKS", "seq": 42}
 ```
 
-Publishing while disconnected raises an error instead of queueing silently.
+Publishing while disconnected raises an error instead of queueing silently,
+and so does publishing to a subject the server's permissions don't allow
+(NATS reports that asynchronously; the action waits for it and fails).
 
 ## Event: `nats_message`
 

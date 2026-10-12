@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -82,6 +83,17 @@ class InvalidAuth(Exception):
     """The server rejected the credentials."""
 
 
+_PUBLISH_DENIED = re.compile(r'permissions violation for publish to "([^"]+)"', re.IGNORECASE)
+
+
+class PermissionDenied(Exception):
+    """The server refused a publish to this subject."""
+
+    def __init__(self, subject: str) -> None:
+        super().__init__(subject)
+        self.subject = subject
+
+
 def _is_auth_error(err: BaseException) -> bool:
     return "authorization violation" in str(err).lower()
 
@@ -133,6 +145,9 @@ class NatsBridge:
         self._config = config
         self._on_auth_failed = on_auth_failed
         self._auth_failure_reported = False
+        # Subjects the server refused since their last publish. The server
+        # reports a denied PUB asynchronously, through the error callback.
+        self._denied_publishes: set[str] = set()
         self._client: Client | None = None
         self._tasks: set[asyncio.Task] = set()
         self._stopping = False
@@ -222,6 +237,10 @@ class NatsBridge:
         self._notify_state()
 
     async def _on_error(self, err: Exception) -> None:
+        if denied := _PUBLISH_DENIED.search(str(err)):
+            self._denied_publishes.add(denied.group(1))
+            _LOGGER.debug("NATS server refused a publish: %s", err)
+            return
         if _is_auth_error(err) and not self._auth_failure_reported:
             self._auth_failure_reported = True
             _LOGGER.warning("NATS server at %s rejected the credentials", self._config.url)
@@ -314,17 +333,33 @@ class NatsBridge:
         payload: Any,
         headers: dict[str, str] | None,
         jetstream: bool,
-    ) -> dict[str, Any] | None:
-        """Publish; with jetstream=True return the stream ack."""
+    ) -> dict[str, Any]:
+        """Publish and return what happened; with jetstream=True, the stream ack.
+
+        Raises PermissionDenied when the server refuses the subject. For a
+        core publish the server's -ERR arrives before the PONG that completes
+        flush(), and nats-py runs the error callback inline, so the refusal is
+        known by the time flush() returns.
+        """
         if not self.connected:
             raise NotConnected
         data = encode_payload(payload)
+        self._denied_publishes.discard(subject)
         if jetstream:
-            ack = await self._client.jetstream().publish(subject, data, headers=headers)
-            return {"stream": ack.stream, "seq": ack.seq}
+            try:
+                ack = await self._client.jetstream().publish(subject, data, headers=headers)
+            except NatsError as err:
+                if subject in self._denied_publishes:
+                    self._denied_publishes.discard(subject)
+                    raise PermissionDenied(subject) from err
+                raise
+            return {"subject": subject, "jetstream": True, "stream": ack.stream, "seq": ack.seq}
         await self._client.publish(subject, data, headers=headers)
         await self._client.flush(timeout=CONNECT_TIMEOUT)
-        return None
+        if subject in self._denied_publishes:
+            self._denied_publishes.discard(subject)
+            raise PermissionDenied(subject)
+        return {"subject": subject, "jetstream": False}
 
 
 class NotConnected(Exception):

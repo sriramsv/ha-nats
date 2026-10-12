@@ -46,6 +46,7 @@ from .bridge import (
     InvalidAuth,
     NatsBridge,
     NotConnected,
+    PermissionDenied,
     probe_connection,
 )
 from .const import (
@@ -197,6 +198,12 @@ def _register_publish(hass: HomeAssistant) -> None:
         except NotConnected as err:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="not_connected"
+            ) from err
+        except PermissionDenied as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="permission_denied",
+                translation_placeholders={"subject": err.subject},
             ) from err
         except (NatsError, TimeoutError) as err:
             raise HomeAssistantError(
