@@ -1,0 +1,18 @@
+publish:
+  fields:
+    subject:
+      required: true
+      example: tasks.ask
+      selector:
+        text:
+    payload:
+      example: '{"title": "Why is the porch light on?"}'
+      selector:
+        object:
+    headers:
+      selector:
+        object:
+    jetstream:
+      default: false
+      selector:
+        boolean:

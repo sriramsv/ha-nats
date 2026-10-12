@@ -1,0 +1,34 @@
+{
+  "services": {
+    "publish": {
+      "name": "Publish",
+      "description": "Publishes a message to a NATS subject.",
+      "fields": {
+        "subject": {
+          "name": "Subject",
+          "description": "Subject to publish to. No spaces or wildcards."
+        },
+        "payload": {
+          "name": "Payload",
+          "description": "A mapping or list is sent as JSON; a string is sent as-is."
+        },
+        "headers": {
+          "name": "Headers",
+          "description": "Optional NATS headers (string keys and values)."
+        },
+        "jetstream": {
+          "name": "JetStream",
+          "description": "Publish through JetStream and wait for the stream's ack. Requires a stream that captures the subject."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_connected": {
+      "message": "Not connected to the NATS server."
+    },
+    "publish_failed": {
+      "message": "Publishing to {subject} failed: {error}"
+    }
+  }
+}
