@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,12 +74,65 @@ def encode_payload(payload: Any) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+class CannotConnect(Exception):
+    """The server couldn't be reached."""
+
+
+class InvalidAuth(Exception):
+    """The server rejected the credentials."""
+
+
+def _is_auth_error(err: BaseException) -> bool:
+    return "authorization violation" in str(err).lower()
+
+
+async def probe_connection(
+    url: str, user: str | None, password: str | None, client_name: str
+) -> None:
+    """Connect once and disconnect; raise InvalidAuth or CannotConnect.
+
+    nats-py's connect() hangs on an unreachable server when reconnects are
+    disabled, so allow exactly one retry (it then raises NoServersError) and
+    keep an outer timeout as a backstop. Auth failures only show up in the
+    error callback, so collect those.
+    """
+    errors: list[Exception] = []
+
+    async def collect(err: Exception) -> None:
+        errors.append(err)
+
+    try:
+        async with asyncio.timeout(CONNECT_TIMEOUT * 3):
+            client = await nats.connect(
+                servers=[url],
+                user=user,
+                password=password,
+                name=client_name,
+                connect_timeout=CONNECT_TIMEOUT,
+                max_reconnect_attempts=1,
+                reconnect_time_wait=0.5,
+                error_cb=collect,
+            )
+    except (NatsError, OSError, TimeoutError) as err:
+        if any(_is_auth_error(e) for e in (*errors, err)):
+            raise InvalidAuth from err
+        raise CannotConnect(str(err) or type(err).__name__) from err
+    await client.close()
+
+
 class NatsBridge:
     """Owns the NATS connection and the background tasks around it."""
 
-    def __init__(self, hass: HomeAssistant, config: BridgeConfig) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config: BridgeConfig,
+        on_auth_failed: Callable[[], None] | None = None,
+    ) -> None:
         self._hass = hass
         self._config = config
+        self._on_auth_failed = on_auth_failed
+        self._auth_failure_reported = False
         self._client: Client | None = None
         self._tasks: set[asyncio.Task] = set()
         self._stopping = False
@@ -103,6 +157,13 @@ class NatsBridge:
         if self._client is not None and not self._client.is_closed:
             try:
                 await self._client.close()
+            except asyncio.CancelledError:
+                # With a JetStream fetch pending, nats-py's close() can raise a
+                # stray CancelledError from the transport's wait_closed(). Only
+                # propagate it if this task itself is being cancelled.
+                if (task := asyncio.current_task()) and task.cancelling():
+                    raise
+                _LOGGER.debug("NATS close interrupted; the connection is closed")
             except NatsError as err:
                 _LOGGER.debug("Error closing NATS connection: %s", err)
         self._notify_state()
@@ -157,9 +218,16 @@ class NatsBridge:
 
     async def _on_reconnected(self) -> None:
         _LOGGER.info("Reconnected to NATS")
+        self._auth_failure_reported = False
         self._notify_state()
 
     async def _on_error(self, err: Exception) -> None:
+        if _is_auth_error(err) and not self._auth_failure_reported:
+            self._auth_failure_reported = True
+            _LOGGER.warning("NATS server at %s rejected the credentials", self._config.url)
+            if self._on_auth_failed is not None:
+                self._on_auth_failed()
+            return
         _LOGGER.debug("NATS client error: %s", err)
 
     def _notify_state(self) -> None:
@@ -221,6 +289,22 @@ class NatsBridge:
                 ),
             )
         return await js.pull_subscribe_bind(durable=spec.durable, stream=spec.stream)
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Connection details for the diagnostics download (no secrets)."""
+        client = self._client
+        return {
+            "connected": self.connected,
+            "server_version": (
+                str(client.connected_server_version)
+                if client is not None and self.connected else None
+            ),
+            "subscriptions": list(self._config.subscribe),
+            "consumers": [
+                {"stream": c.stream, "durable": c.durable, "filter_subject": c.filter_subject}
+                for c in self._config.consume
+            ],
+        }
 
     # -- outbound ----------------------------------------------------------
 

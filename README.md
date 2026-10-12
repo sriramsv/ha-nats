@@ -8,7 +8,8 @@ server. It can:
 - turn messages from **core subscriptions** into `nats_message` events;
 - read **JetStream durable consumers** at-least-once, so messages published
   while Home Assistant was down are delivered when it comes back;
-- report the connection as `binary_sensor.nats_connected`.
+- report the connection as `binary_sensor.nats_connected`;
+- be set up entirely from the UI, with reauth, reconfigure and diagnostics.
 
 ## Installation
 
@@ -25,31 +26,42 @@ directory and restart.
 
 ## Configuration
 
-Configured in YAML:
+**Settings → Devices & services → Add integration → NATS.**
+
+1. Enter the server URL (`nats://host:4222`, or `tls://` for TLS), and a
+   username and password if the server needs them. The connection is tested
+   before saving: a wrong password or an unreachable server shows up in the
+   form.
+2. Open the integration's **Configure** to choose what to listen to:
+
+| Option | Meaning |
+|--------|---------|
+| Subjects to subscribe to | Core subscriptions. Wildcards allowed (`*`, and `>` as the last token). At-most-once: messages sent while disconnected are lost. |
+| JetStream durable consumers | A list of `stream`, `durable`, and optional `filter_subject`. Missing consumers are created (explicit ack, deliver all). Each message fires an event, **then** is acked, so a crash in between means redelivery, never loss. |
 
 ```yaml
-nats:
-  url: nats://192.168.1.10:4222
-  user: ha                          # optional
-  password: !secret nats_password   # optional
-  client_name: home-assistant       # optional, shown in the server's connz
-  subscribe:                        # optional: core subscriptions
-    - sensors.>
-  consume:                          # optional: JetStream durable pull consumers
-    - stream: REPLIES
-      durable: ha
-      filter_subject: replies.ha.>  # optional
+# JetStream durable consumers field
+- stream: REPLIES
+  durable: ha
+  filter_subject: replies.ha.>   # optional
 ```
 
-| Key | Meaning |
-|-----|---------|
-| `url` | Server URL. |
-| `user`, `password` | Username/password auth. |
-| `subscribe` | Subjects to subscribe to. Wildcards allowed (`*`, and `>` as the last token). Core subscriptions are at-most-once: messages sent while disconnected are lost. |
-| `consume` | Durable pull consumers. The consumer is created (explicit ack, deliver all) if it doesn't exist. Each message fires an event, **then** is acked, so a crash in between means redelivery, never loss. |
+Saving the options reconnects with the new listeners; no restart needed.
+**Reconfigure** changes the URL or credentials later. If the server starts
+rejecting the password (say, after a rotation), Home Assistant shows a
+re-authentication prompt.
 
-Setup never waits on the server: if it's unreachable, Home Assistant starts
-normally and the integration keeps retrying in the background.
+Only one NATS server per Home Assistant is supported.
+
+If the server is unreachable when Home Assistant starts, the integration
+retries setup in the background; once connected, it reconnects on its own.
+
+### Migrating from YAML
+
+Version 0.1 was configured in YAML. On first start with 0.2, an existing
+`nats:` block is imported into the UI (the `user` key becomes the
+username) and a repair notice asks you to delete the YAML. Entity IDs and
+history are kept.
 
 ## Service: `nats.publish`
 
